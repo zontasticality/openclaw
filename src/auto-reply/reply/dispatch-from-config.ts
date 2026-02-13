@@ -1,9 +1,13 @@
+import fs from "node:fs";
 import type { OpenClawConfig } from "../../config/config.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
 import type { FinalizedMsgContext } from "../templating.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { loadSessionStore, resolveStorePath } from "../../config/sessions.js";
+import { resolveSessionFilePath } from "../../config/sessions/paths.js";
+import { getGateway as getDiscordGateway } from "../../discord/monitor/gateway-registry.js";
 import { logVerbose } from "../../globals.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import { isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
@@ -479,11 +483,13 @@ export async function dispatchReplyFromConfig(params: {
         // Resolve session stats for hook consumers.
         let sessionStats: Record<string, unknown> | undefined;
         const sessionKey = ctx.SessionKey ?? "";
+        let sessionEntry: SessionEntry | undefined;
         if (sessionKey) {
           try {
             const storePath = resolveStorePath();
             const store = loadSessionStore(storePath);
             const entry = store[sessionKey];
+            sessionEntry = entry;
             if (entry) {
               sessionStats = {
                 contextTokens: entry.contextTokens,
@@ -510,6 +516,63 @@ export async function dispatchReplyFromConfig(params: {
         ).catch((err) => {
           logVerbose(`dispatch-from-config: agent:response internal hook failed: ${String(err)}`);
         });
+
+        // Update Discord bot presence with context usage stats.
+        // Done inline (not via hook) because bundled hooks load in a separate
+        // module graph and cannot access the gateway singleton.
+        try {
+          const gw = getDiscordGateway("default") as
+            | { isConnected?: boolean; updatePresence?: (d: unknown) => void }
+            | undefined;
+          if (gw?.isConnected && gw.updatePresence) {
+            let usedTokens: number | null = null;
+            const maxTokens = (sessionStats?.contextTokens as number | undefined) ?? 200_000;
+            if (sessionEntry?.sessionId) {
+              try {
+                const transcriptPath = resolveSessionFilePath(sessionEntry.sessionId, sessionEntry);
+                if (fs.existsSync(transcriptPath)) {
+                  const content = fs.readFileSync(transcriptPath, "utf-8");
+                  const lines = content.split("\n");
+                  for (let i = lines.length - 1; i >= 0; i--) {
+                    if (!lines[i]) {
+                      continue;
+                    }
+                    try {
+                      const parsed = JSON.parse(lines[i]) as Record<string, unknown>;
+                      const u =
+                        (parsed.message as Record<string, unknown> | undefined)?.usage ??
+                        parsed.usage;
+                      if (
+                        u &&
+                        typeof u === "object" &&
+                        "totalTokens" in (u as Record<string, unknown>)
+                      ) {
+                        usedTokens = (u as Record<string, number>).totalTokens;
+                        break;
+                      }
+                    } catch {
+                      /* skip malformed lines */
+                    }
+                  }
+                }
+              } catch {
+                /* non-critical */
+              }
+            }
+            const statusText =
+              usedTokens != null
+                ? `💡 Context: ${usedTokens.toLocaleString()}/${maxTokens.toLocaleString()} (${((usedTokens / maxTokens) * 100).toFixed(1)}%)`
+                : "💡 Online";
+            gw.updatePresence({
+              since: null,
+              activities: [{ name: statusText, type: 0 }],
+              status: "online",
+              afk: false,
+            });
+          }
+        } catch {
+          // Non-critical — presence update is best-effort.
+        }
       }
     }
 
